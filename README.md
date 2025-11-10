@@ -1,4 +1,4 @@
-# Isoforms
+# Isoform PPI Network
 
 ## Building an isoform-aware CellChat database
 
