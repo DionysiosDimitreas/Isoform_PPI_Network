@@ -74,3 +74,9 @@ The table includes the following columns:
 ```
 python3 build_isoform_network.py
 ```
+
+7. Build Isoform Database in CellChatDB format
+
+```
+Rscript scripts/build-isoformDB.R
+```
