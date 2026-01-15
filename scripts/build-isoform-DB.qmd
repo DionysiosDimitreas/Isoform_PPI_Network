@@ -1,0 +1,577 @@
+---
+title: "db_final"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+## Import new ENST - ENST database
+
+my_isoform_ppi_df <- read.delim("../data/transcript_specific_interactions_2.tsv", 
+                          header = TRUE,
+                          sep = "\t",
+                          stringsAsFactors = FALSE)
+```
+
+## Expand CellChat Database to Isoform Level
+
+### Helper Functions
+
+```{r}
+# --- 1. Robust Parse Function ---
+parse_complex <- function(name) {
+  if (name %in% rownames(complex_db)) {
+    # unlist and as.vector ensures we strip weird attributes
+    subunits <- as.vector(na.omit(unlist(complex_db[name, ])))
+    # trimws removes accidental spaces, and we filter empty strings
+    subunits <- subunits[trimws(subunits) != ""]
+    return(subunits)
+  } else {
+    return(character(0))
+  }
+}
+
+expand_cellchat_with_complex_handling <- function(cellchat_row) {
+  
+  ligand_symbol <- cellchat_row$ligand
+  receptor_symbol <- cellchat_row$receptor
+  
+  ligand_is_complex <- ligand_symbol %in% complex_ligands
+  receptor_is_complex <- receptor_symbol %in% complex_receptors
+  
+  # --- HELPER: Get all isoforms (Unfiltered) ---
+  get_isoforms_from_symbol <- function(gene_sym) {
+    # Check Ligand column
+    lig_ensts <- my_isoform_ppi_df %>% 
+      filter(ligand_gene == gene_sym) %>% 
+      pull(ligand_transcript)
+    
+    # Check Receptor column
+    rec_ensts <- my_isoform_ppi_df %>% 
+      filter(receptor_gene == gene_sym) %>% 
+      pull(receptor_transcript)
+    
+    all_ensts <- unique(c(lig_ensts, rec_ensts))
+    
+    if (length(all_ensts) > 0) {
+      return(all_ensts)
+    } else {
+      # Fallback to symbol if no isoforms found (prevents crash)
+      return(gene_sym)
+    }
+  }
+
+  # --- HELPER: Validate Interaction ---
+  # Checks if ANY isoform on the left interacts with ANY isoform on the right
+  validate_interaction <- function(ligand_isoforms, receptor_isoforms) {
+    # subset PPI to relevant transcripts to speed up check
+    relevant_ppi <- my_isoform_ppi_df %>%
+      filter(
+        (ligand_transcript %in% ligand_isoforms & receptor_transcript %in% receptor_isoforms) |
+        (receptor_transcript %in% ligand_isoforms & ligand_transcript %in% receptor_isoforms)
+      )
+    return(nrow(relevant_ppi) > 0)
+  }
+
+  # =========================================================================
+  # CASE 1: Simple -> Simple
+  # =========================================================================
+  if (!ligand_is_complex && !receptor_is_complex) {
+    l_isoforms <- get_isoforms_from_symbol(ligand_symbol)
+    r_isoforms <- get_isoforms_from_symbol(receptor_symbol)
+    
+    # Expand Grid
+    combos <- expand.grid(L = l_isoforms, R = r_isoforms, stringsAsFactors = FALSE)
+    
+    # Filter valid interactions
+    valid_rows <- do.call(rbind, lapply(1:nrow(combos), function(i) {
+      l_curr <- combos$L[i]
+      r_curr <- combos$R[i]
+      
+      if (validate_interaction(l_curr, r_curr)) {
+        new_row <- cellchat_row
+        new_row$ligand <- l_curr
+        new_row$receptor <- r_curr
+        new_row$interaction_name <- paste(ligand_symbol, receptor_symbol, sep = "_")
+        new_row$interaction_name_2 <- paste(l_curr, r_curr, sep = " - ")
+        return(new_row)
+      } else {
+        return(NULL)
+      }
+    }))
+    
+    return(list(interactions = valid_rows, complex_mapping = data.frame()))
+  }
+
+  # =========================================================================
+  # CASE 2: Simple -> Complex
+  # =========================================================================
+  if (!ligand_is_complex && receptor_is_complex) {
+    l_isoforms <- get_isoforms_from_symbol(ligand_symbol)
+    
+    # 1. Get subunits
+    rec_subunits <- parse_complex(receptor_symbol)
+    
+    # 2. Get all isoforms for each subunit (No filtering yet!)
+    rec_subunit_isoforms <- lapply(rec_subunits, get_isoforms_from_symbol)
+    names(rec_subunit_isoforms) <- rec_subunits
+    
+    # 3. Expand all possible receptor complex combinations
+    # This assumes independent assembly (we don't check intra-complex binding here)
+    rec_combos <- expand.grid(rec_subunit_isoforms, stringsAsFactors = FALSE)
+    
+    # 4. Iterate and validate against Ligand
+    interactions <- list()
+    complex_map_list <- list()
+    
+    if(nrow(rec_combos) > 0) {
+      for (i in 1:nrow(rec_combos)) {
+        # Construct complex name
+        curr_rec_sub_isos <- as.character(rec_combos[i, ])
+        complex_name <- paste(curr_rec_sub_isos, collapse = "_")
+        
+        # Does this specific complex combination interact with ANY ligand isoform?
+        # We pass the vector of subunits. If ANY subunit binds the ligand, it counts.
+        if (validate_interaction(l_isoforms, curr_rec_sub_isos)) {
+          
+          # Now find WHICH ligand isoform specifically binds (could be multiple)
+          for (l_iso in l_isoforms) {
+            if (validate_interaction(l_iso, curr_rec_sub_isos)) {
+              new_row <- cellchat_row
+              new_row$ligand <- l_iso
+              new_row$receptor <- complex_name
+              new_row$interaction_name <- paste(ligand_symbol, receptor_symbol, sep = "_")
+              new_row$interaction_name_2 <- paste(l_iso, complex_name, sep = " - ")
+              interactions[[length(interactions) + 1]] <- new_row
+            }
+          }
+          
+          # Save Mapping
+          map_row <- data.frame(complex_name = complex_name, stringsAsFactors = FALSE)
+          for (k in seq_along(curr_rec_sub_isos)) {
+            map_row[[paste0("subunit_", k)]] <- curr_rec_sub_isos[k]
+          }
+          complex_map_list[[length(complex_map_list) + 1]] <- map_row
+        }
+      }
+    }
+    
+    return(list(
+      interactions = do.call(rbind, interactions), 
+      complex_mapping = do.call(rbind, complex_map_list)
+    ))
+  }
+
+  # =========================================================================
+  # CASE 3: Complex -> Simple
+  # =========================================================================
+  if (ligand_is_complex && !receptor_is_complex) {
+    r_isoforms <- get_isoforms_from_symbol(receptor_symbol)
+    
+    lig_subunits <- parse_complex(ligand_symbol)
+    lig_subunit_isoforms <- lapply(lig_subunits, get_isoforms_from_symbol)
+    lig_combos <- expand.grid(lig_subunit_isoforms, stringsAsFactors = FALSE)
+    
+    interactions <- list()
+    complex_map_list <- list()
+    
+    if(nrow(lig_combos) > 0) {
+      for (i in 1:nrow(lig_combos)) {
+        curr_lig_sub_isos <- as.character(lig_combos[i, ])
+        complex_name <- paste(curr_lig_sub_isos, collapse = "_")
+        
+        if (validate_interaction(curr_lig_sub_isos, r_isoforms)) {
+          
+          for (r_iso in r_isoforms) {
+            if (validate_interaction(curr_lig_sub_isos, r_iso)) {
+              new_row <- cellchat_row
+              new_row$ligand <- complex_name
+              new_row$receptor <- r_iso
+              new_row$interaction_name <- paste(ligand_symbol, receptor_symbol, sep = "_")
+              new_row$interaction_name_2 <- paste(complex_name, r_iso, sep = " - ")
+              interactions[[length(interactions) + 1]] <- new_row
+            }
+          }
+          
+          map_row <- data.frame(complex_name = complex_name, stringsAsFactors = FALSE)
+          for (k in seq_along(curr_lig_sub_isos)) {
+            map_row[[paste0("subunit_", k)]] <- curr_lig_sub_isos[k]
+          }
+          complex_map_list[[length(complex_map_list) + 1]] <- map_row
+        }
+      }
+    }
+    
+    return(list(
+      interactions = do.call(rbind, interactions), 
+      complex_mapping = do.call(rbind, complex_map_list)
+    ))
+  }
+
+  # =========================================================================
+  # CASE 4: Complex -> Complex
+  # =========================================================================
+  if (ligand_is_complex && receptor_is_complex) {
+    # 1. Expand Ligand
+    lig_subunits <- parse_complex(ligand_symbol)
+    lig_subunit_isoforms <- lapply(lig_subunits, get_isoforms_from_symbol)
+    lig_combos <- expand.grid(lig_subunit_isoforms, stringsAsFactors = FALSE)
+    
+    # 2. Expand Receptor
+    rec_subunits <- parse_complex(receptor_symbol)
+    rec_subunit_isoforms <- lapply(rec_subunits, get_isoforms_from_symbol)
+    rec_combos <- expand.grid(rec_subunit_isoforms, stringsAsFactors = FALSE)
+    
+    interactions <- list()
+    complex_map_list <- list()
+    
+    # Loop over Ligand Combos
+    if(nrow(lig_combos) > 0 && nrow(rec_combos) > 0) {
+      for (i in 1:nrow(lig_combos)) {
+        curr_lig_sub_isos <- as.character(lig_combos[i, ])
+        l_complex_name <- paste(curr_lig_sub_isos, collapse = "_")
+        
+        # Loop over Receptor Combos
+        for (j in 1:nrow(rec_combos)) {
+          curr_rec_sub_isos <- as.character(rec_combos[j, ])
+          r_complex_name <- paste(curr_rec_sub_isos, collapse = "_")
+          
+          # Check if ANY piece of Ligand Complex binds ANY piece of Receptor Complex
+          if (validate_interaction(curr_lig_sub_isos, curr_rec_sub_isos)) {
+            new_row <- cellchat_row
+            new_row$ligand <- l_complex_name
+            new_row$receptor <- r_complex_name
+            new_row$interaction_name <- paste(ligand_symbol, receptor_symbol, sep = "_")
+            new_row$interaction_name_2 <- paste(l_complex_name, r_complex_name, sep = " - ")
+            interactions[[length(interactions) + 1]] <- new_row
+            
+            # Save Mapping (Ligand)
+            l_map <- data.frame(complex_name = l_complex_name, stringsAsFactors = FALSE)
+            for (k in seq_along(curr_lig_sub_isos)) l_map[[paste0("subunit_", k)]] <- curr_lig_sub_isos[k]
+            complex_map_list[[length(complex_map_list) + 1]] <- l_map
+            
+            # Save Mapping (Receptor)
+            r_map <- data.frame(complex_name = r_complex_name, stringsAsFactors = FALSE)
+            for (k in seq_along(curr_rec_sub_isos)) r_map[[paste0("subunit_", k)]] <- curr_rec_sub_isos[k]
+            complex_map_list[[length(complex_map_list) + 1]] <- r_map
+          }
+        }
+      }
+    }
+    
+    return(list(
+      interactions = do.call(rbind, interactions), 
+      complex_mapping = unique(do.call(rbind, complex_map_list))
+    ))
+  }
+}
+```
+
+## Apply Expansion
+
+```{r}
+# Load the base CellChat DB
+db.human <- CellChatDB.human
+
+# --- !! IMPORTANT: Create 'complex_db' !! ---
+# Your new function depends on this object.
+# We will create it from the standard CellChat 'complex' data frame.
+complex_db <- db.human[["complex"]]
+
+# *** This is the most critical line ***
+all_complex_names <- rownames(complex_db)
+
+complex_ligands <- unique(db.human$interaction$ligand[db.human$interaction$ligand %in% all_complex_names])
+complex_receptors <- unique(db.human$interaction$receptor[db.human$interaction$receptor %in% all_complex_names])
+```
+
+Execute the expansion
+
+```{r}
+# --- 1. Get all genes you have isoform data for ---
+genes_in_my_ppi <- unique(c(my_isoform_ppi_df$ligand_gene, 
+                            my_isoform_ppi_df$receptor_gene))
+
+# --- 2. Get the base gene-level interactions ---
+base_interactions <- db.human$interaction
+
+# --- 3. Filter the base interactions (HIGHLY RECOMMENDED) ---
+# This filters the ~2500 CellChat interactions down to only those
+# where at least one partner is in your PPI file.
+# Note: We must also check subunits of complexes!
+complex_subunits <- unique(c(db.human$complex$subunit_1, db.human$complex$subunit_2, 
+                             db.human$complex$subunit_3, db.human$complex$subunit_4, 
+                             db.human$complex$subunit_5))
+complex_subunits_in_ppi <- complex_subunits[complex_subunits %in% genes_in_my_ppi]
+
+# Keep rows where:
+# 1. The simple ligand is in your PPI
+# 2. The simple receptor is in your PPI
+# 3. The complex ligand has subunits in your PPI
+# 4. The complex receptor has subunits in your PPI
+filtered_interactions <- base_interactions %>%
+  filter(
+    (ligand %in% genes_in_my_ppi) |
+    (receptor %in% genes_in_my_ppi) |
+    (ligand %in% complex_ligands & ligand %in% db.human$complex$complex_name[db.human$complex$complex_name %in% complex_subunits_in_ppi]) |
+    (receptor %in% complex_receptors & receptor %in% db.human$complex$complex_name[db.human$complex$complex_name %in% complex_subunits_in_ppi])
+  )
+  
+cat("Total base interactions:", nrow(base_interactions), "\n")
+cat("Filtered interactions to process:", nrow(filtered_interactions), "\n")
+
+
+# --- 4. Apply your function to each filtered row ---
+# This will be slow if 'filtered_interactions' is large
+cat("Expanding interactions... This may take several minutes.\n")
+
+# Create a list of rows
+interaction_list <- split(filtered_interactions, seq(nrow(filtered_interactions)))
+
+# Apply the function
+results_list <- lapply(interaction_list, expand_cellchat_with_complex_handling)
+
+cat("Expansion complete.\n")
+```
+
+## New complex table
+
+```{r}
+# --- 1. Combine all 'interactions' data frames ---
+isoform_interactions <- dplyr::bind_rows(lapply(results_list, `[[`, "interactions"))
+
+# --- 2. Combine all 'complex_mapping' data frames ---
+isoform_complexes <- dplyr::bind_rows(lapply(results_list, `[[`, "complex_mapping"))
+
+# --- 3. Clean up the new complex table ---
+# Ensure it has the correct columns and no duplicates
+if(nrow(isoform_complexes) > 0) {
+  isoform_complexes_final <- isoform_complexes %>%
+    distinct(complex_name, .keep_all = TRUE) %>%
+    # Ensure it has the same 5 subunit columns as the original
+    # (Your function already does this, but this is a safeguard)
+    mutate(
+      subunit_1 = if("subunit_1" %in% names(.)) subunit_1 else NA_character_,
+      subunit_2 = if("subunit_2" %in% names(.)) subunit_2 else NA_character_,
+      subunit_3 = if("subunit_3" %in% names(.)) subunit_3 else NA_character_,
+      subunit_4 = if("subunit_4" %in% names(.)) subunit_4 else NA_character_,
+      subunit_5 = if("subunit_5" %in% names(.)) subunit_5 else NA_character_
+    ) %>%
+    select(complex_name, subunit_1, subunit_2, subunit_3, subunit_4, subunit_5)
+} else {
+  # Create an empty but correctly structured data frame if no complexes were found
+  isoform_complexes_final <- data.frame(
+    complex_name = character(), subunit_1 = character(), subunit_2 = character(),
+    subunit_3 = character(), subunit_4 = character(), subunit_5 = character()
+  )
+}
+
+rownames(isoform_complexes_final) <- isoform_complexes_final$complex_name
+isoform_complexes_final$complex_name <- NULL
+
+# --- 4. Create your final database object ---
+myIsoformCellChatDB <- list(
+  interaction = isoform_interactions,
+  complex = isoform_complexes_final,
+  cofactor = db.human$cofactor, # We re-use the original cofactor
+  geneInfo = db.human$geneInfo  # We re-use the original geneInfo
+)
+
+cat("New isoform-level database 'myIsoformCellChatDB' is built.\n")
+print(paste("Total isoform interactions:", nrow(myIsoformCellChatDB$interaction)))
+print(paste("Total isoform complexes:", nrow(myIsoformCellChatDB$complex)))
+```
+
+## Adding geneInfo table
+
+```{r}
+
+# --- 1. Extract and Combine Mappings ---
+
+# Create a two-column map for ligands: Transcript -> Gene
+ligand_map <- data.frame(
+  Transcript = my_isoform_ppi_df$ligand_transcript,
+  Gene = my_isoform_ppi_df$ligand_gene,
+  stringsAsFactors = FALSE
+)
+
+# Create a two-column map for receptors: Transcript -> Gene
+receptor_map <- data.frame(
+  Transcript = my_isoform_ppi_df$receptor_transcript,
+  Gene = my_isoform_ppi_df$receptor_gene,
+  stringsAsFactors = FALSE
+)
+
+# Stack the two maps on top of each other
+combined_map <- rbind(ligand_map, receptor_map)
+
+# --- 2. De-duplicate and Format ---
+
+# Get only the unique transcript-to-gene pairs
+new_geneInfo <- unique(combined_map)
+
+# Rename the columns exactly as you requested
+colnames(new_geneInfo) <- c("Symbol", "gene.symbol")
+
+# Remove any potential NA/empty transcript IDs
+new_geneInfo <- new_geneInfo[!is.na(new_geneInfo$Symbol) & new_geneInfo$Symbol != "", ]
+
+# Set the row names to be the transcript IDs (the 'Symbol' column)
+# This is standard practice for CellChatDB objects and good for lookups
+rownames(new_geneInfo) <- new_geneInfo$Symbol
+
+# --- 4. Replace the old $geneInfo table ---
+myIsoformCellChatDB$geneInfo <- new_geneInfo
+
+# --- 5. (Optional) Check the result ---
+cat("Successfully updated $geneInfo. Here's the new structure:\n")
+print(head(myIsoformCellChatDB$geneInfo))
+```
+
+## Tricky: How to handle cofactors
+
+```{r}
+# Get all genes from the cofactor table
+cofactor_genes <- db.human$cofactor %>%
+  unlist() %>%
+  unique()
+
+genes_to_pool <- cofactor_genes[!is.na(cofactor_genes) & cofactor_genes != ""]
+
+cat("Found", length(genes_to_pool), "unique gene symbols in the cofactor table.\n")
+
+# EXTRA: Add cofactor symbols to geneInfo
+# Get the names of the new rows we added
+new_feature_names <- genes_to_pool
+
+# Create a new data.frame for these features
+new_geneInfo_rows <- data.frame(
+  Symbol = new_feature_names,
+  gene.symbol = new_feature_names,
+  row.names = new_feature_names
+)
+
+# Add these new rows to your modified database's geneInfo
+myIsoformCellChatDB[["geneInfo"]] <- rbind(myIsoformCellChatDB[["geneInfo"]], new_geneInfo_rows)
+
+print("Successfully updated myIsoformCellChatDB[['geneInfo']] with pooled feature names.")
+```
+
+```{r}
+saveRDS(myIsoformCellChatDB, file = "../data/myIsoformCellChatDB_NEW.rds")
+```
+
+Load object from R project
+
+```{r}
+getwd()
+results_list <- readRDS("../results/dengue_1-026.rds")
+```
+
+Create a hybrid object that includes transcript counts + cofactor gene counts
+
+```{r}
+# Get the counts matrix (aggregation should be on raw counts)
+counts_matrix <- assay(sce_pc, "X")
+
+
+# Connect to the Ensembl BioMart
+ensembl_mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                        dataset = "hsapiens_gene_ensembl",
+                        host = "https://useast.ensembl.org")
+
+# Get the transcript mappings for ALL your cofactor genes in one query
+cofactor_genes <- db.human$cofactor %>%
+  unlist() %>%
+  unique()
+
+genes_to_pool <- cofactor_genes[!is.na(cofactor_genes) & cofactor_genes != ""]
+
+tx_map <- getBM(attributes = c('ensembl_transcript_id', 'hgnc_symbol'),
+                filters = 'hgnc_symbol',
+                values = genes_to_pool,
+                mart = ensembl_mart)
+
+print(paste("Found", nrow(tx_map), "transcript-to-gene mappings."))
+
+# List to store the new, pooled expression vectors
+pooled_rows <- list()
+
+print("Starting aggregation...")
+for (gene in genes_to_pool) {
+  
+  # 1. Find all transcripts (ENST IDs) for this gene *from our BioMart map*
+  tx_for_gene <- tx_map$ensembl_transcript_id[tx_map$hgnc_symbol == gene]
+  
+  # 2. Find which of these transcripts are actually in your sce object
+  tx_in_sce <- intersect(tx_for_gene, rownames(counts_matrix))
+  
+  if (length(tx_in_sce) > 0) {
+    # 3. Subset the counts matrix for these transcripts
+    # drop=FALSE ensures it stays a matrix even if only 1 tx is found
+    tx_counts <- counts_matrix[tx_in_sce, , drop = FALSE]
+    
+    # 4. Aggregate by summing the columns (colSums)
+    if (nrow(tx_counts) > 1) {
+      pooled_expression <- colSums(tx_counts)
+    } else {
+      pooled_expression <- tx_counts[1, ] # Just take the single row
+    }
+    
+    # 5. Store the new pooled vector
+    pooled_rows[[gene]] <- pooled_expression
+    print(paste("Successfully pooled", length(tx_in_sce), "transcripts for:", gene))
+    
+  } else {
+    warning(paste("No transcripts for", gene, "found in sce object. Skipping."))
+  }
+}
+
+sce_modified <- sce_pc_loc
+
+# --- Combine and Update sce object (No change from before) ---
+if (length(pooled_rows) > 0) {
+  
+  # 1. Create the matrix of new pooled rows
+  new_rows_matrix <- do.call(rbind, pooled_rows)
+  if (is(counts_matrix, "sparseMatrix")) {
+    new_rows_matrix <- as(new_rows_matrix, "sparseMatrix")
+  }
+
+  # 2. IMPORTANT: Remove normalized assays from the *original* object first.
+  # rbind will fail or produce NAs if these assays don't exist in both objects.
+  if ("log1p" %in% assayNames(sce_modified)) {
+    assays(sce_modified)[["log1p"]] <- NULL
+  }
+  if ("norm" %in% assayNames(sce_modified)) {
+    assays(sce_modified)[["norm"]] <- NULL
+  }
+  print("Removed 'log1p' and 'norm' assays from original object before combining.")
+
+  # 3. Create a new, temporary SingleCellExperiment object for the pooled rows
+  # It MUST have the same colData and assay name ("X") to be compatible
+  sce_new_rows <- SingleCellExperiment(
+    assays = list(X = new_rows_matrix), # Must match the assay name 'X'
+    colData = colData(sce_modified)      # Must include colData for rbind
+  )
+
+  # 4. Combine the original sce and the new rows object
+  print(paste("Original sce features:", nrow(sce_modified)))
+  print(paste("New pooled features:", nrow(sce_new_rows)))
+  
+  sce_combined <- rbind(sce_modified, sce_new_rows)
+
+  # 5. Update our main 'sce_modified' variable to be this new combined object
+  sce_modified <- sce_combined
+  
+  print(paste("New combined sce features:", nrow(sce_modified)))
+  print("Successfully added pooled cofactor rows to sce object.")
+  print("WARNING: You MUST re-normalize the 'sce_modified' object's 'X' assay.")
+  
+} else {
+  print("No cofactor genes were found or pooled. 'sce' object is unchanged.")
+}
+
+
+print(sce_modified)
+```
