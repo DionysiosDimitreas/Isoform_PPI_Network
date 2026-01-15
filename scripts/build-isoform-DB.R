@@ -25,208 +25,233 @@ expand_cellchat_with_complex_handling <- function(cellchat_row) {
   ligand_symbol <- cellchat_row$ligand
   receptor_symbol <- cellchat_row$receptor
   
-  # Check complexity status
   ligand_is_complex <- ligand_symbol %in% complex_ligands
   receptor_is_complex <- receptor_symbol %in% complex_receptors
   
-  # Helper to find all isoforms associated with a given gene symbol from PPI file
+  # --- HELPER: Get all isoforms (Unfiltered) ---
   get_isoforms_from_symbol <- function(gene_sym) {
-    # Find all ligand transcripts associated with this gene
+    # Check Ligand column
     lig_ensts <- my_isoform_ppi_df %>% 
       filter(ligand_gene == gene_sym) %>% 
-      distinct(ligand_transcript) %>%
       pull(ligand_transcript)
-      
-    # Find all receptor transcripts associated with this gene
+    
+    # Check Receptor column
     rec_ensts <- my_isoform_ppi_df %>% 
       filter(receptor_gene == gene_sym) %>% 
-      distinct(receptor_transcript) %>%
       pull(receptor_transcript)
-      
+    
     all_ensts <- unique(c(lig_ensts, rec_ensts))
     
     if (length(all_ensts) > 0) {
-      return(data.frame(gene_symbol = gene_sym, 
-                        ENST = all_ensts, 
-                        ENSP = NA, 
-                        stringsAsFactors = FALSE))
+      return(all_ensts)
     } else {
-      return(data.frame(gene_symbol = gene_sym, 
-                        ENST = gene_sym, 
-                        ENSP = NA, 
-                        stringsAsFactors = FALSE))
+      # Fallback to symbol if no isoforms found (prevents crash)
+      return(gene_sym)
     }
   }
 
-  # Helper function to find interacting subunit isoforms
-  find_interacting_subunit_isoforms <- function(subunit_gene, partner_ensts) {
-    matches_A <- my_isoform_ppi_df %>%
-      filter(ligand_gene == subunit_gene & receptor_transcript %in% partner_ensts) %>%
-      pull(ligand_transcript)
-      
-    matches_B <- my_isoform_ppi_df %>%
-      filter(receptor_gene == subunit_gene & ligand_transcript %in% partner_ensts) %>%
-      pull(receptor_transcript)
-      
-    return(unique(c(matches_A, matches_B)))
+  # --- HELPER: Validate Interaction ---
+  # Checks if ANY isoform on the left interacts with ANY isoform on the right
+  validate_interaction <- function(ligand_isoforms, receptor_isoforms) {
+    # subset PPI to relevant transcripts to speed up check
+    relevant_ppi <- my_isoform_ppi_df %>%
+      filter(
+        (ligand_transcript %in% ligand_isoforms & receptor_transcript %in% receptor_isoforms) |
+        (receptor_transcript %in% ligand_isoforms & ligand_transcript %in% receptor_isoforms)
+      )
+    return(nrow(relevant_ppi) > 0)
   }
 
-  # --- CASE 1: Simple Ligand -> Simple Receptor ---
+  # =========================================================================
+  # CASE 1: Simple -> Simple
+  # =========================================================================
   if (!ligand_is_complex && !receptor_is_complex) {
-    ligand_mapping <- get_isoforms_from_symbol(ligand_symbol)
-    receptor_mapping <- get_isoforms_from_symbol(receptor_symbol)
+    l_isoforms <- get_isoforms_from_symbol(ligand_symbol)
+    r_isoforms <- get_isoforms_from_symbol(receptor_symbol)
     
-    expanded_rows <- do.call(rbind, lapply(seq_len(nrow(ligand_mapping)), function(i) {
-      ligand_enst <- ligand_mapping$ENST[i]
-      ligand_ensp <- ligand_mapping$ENSP[i]
+    # Expand Grid
+    combos <- expand.grid(L = l_isoforms, R = r_isoforms, stringsAsFactors = FALSE)
+    
+    # Filter valid interactions
+    valid_rows <- do.call(rbind, lapply(1:nrow(combos), function(i) {
+      l_curr <- combos$L[i]
+      r_curr <- combos$R[i]
       
-      do.call(rbind, lapply(seq_len(nrow(receptor_mapping)), function(j) {
-        receptor_enst <- receptor_mapping$ENST[j]
-        receptor_ensp <- receptor_mapping$ENSP[j]
-        
-        interaction_exists <- any(
-          (my_isoform_ppi_df$ligand_transcript == ligand_enst & my_isoform_ppi_df$receptor_transcript == receptor_enst) |
-          (my_isoform_ppi_df$receptor_transcript == ligand_enst & my_isoform_ppi_df$ligand_transcript == receptor_enst)
-        )
-        
-        if (!interaction_exists) return(NULL)
-        
+      if (validate_interaction(l_curr, r_curr)) {
         new_row <- cellchat_row
-        new_row$ligand <- ligand_enst
-        new_row$receptor <- receptor_enst
+        new_row$ligand <- l_curr
+        new_row$receptor <- r_curr
         new_row$interaction_name <- paste(ligand_symbol, receptor_symbol, sep = "_")
-        new_row$interaction_name_2 <- paste(ligand_enst, "-", receptor_enst)
-        new_row$ligand_gene_symbol <- ligand_symbol
-        new_row$receptor_gene_symbol <- receptor_symbol
-        new_row$ligand_ensp <- ligand_ensp
-        new_row$receptor_ensp <- receptor_ensp
-        new_row
-      }))
+        new_row$interaction_name_2 <- paste(l_curr, r_curr, sep = " - ")
+        return(new_row)
+      } else {
+        return(NULL)
+      }
     }))
-    return(list(interactions = expanded_rows, complex_mapping = data.frame()))
+    
+    return(list(interactions = valid_rows, complex_mapping = data.frame()))
   }
-  
-  # --- CASE 2: Simple Ligand -> Complex Receptor ---
+
+  # =========================================================================
+  # CASE 2: Simple -> Complex
+  # =========================================================================
   if (!ligand_is_complex && receptor_is_complex) {
-    ligand_mapping <- get_isoforms_from_symbol(ligand_symbol)
-    ligand_ensts <- ligand_mapping$ENST
-    subunit_symbols <- parse_complex(receptor_symbol)
+    l_isoforms <- get_isoforms_from_symbol(ligand_symbol)
     
-    subunit_interacting_isoforms <- list()
-    for (subunit_symbol in subunit_symbols) {
-      interacting_isoforms <- find_interacting_subunit_isoforms(subunit_symbol, ligand_ensts)
-      if (length(interacting_isoforms) == 0) return(list(interactions = data.frame(), complex_mapping = data.frame()))
-      subunit_interacting_isoforms[[subunit_symbol]] <- interacting_isoforms
+    # 1. Get subunits
+    rec_subunits <- parse_complex(receptor_symbol)
+    
+    # 2. Get all isoforms for each subunit (No filtering yet!)
+    rec_subunit_isoforms <- lapply(rec_subunits, get_isoforms_from_symbol)
+    names(rec_subunit_isoforms) <- rec_subunits
+    
+    # 3. Expand all possible receptor complex combinations
+    # This assumes independent assembly (we don't check intra-complex binding here)
+    rec_combos <- expand.grid(rec_subunit_isoforms, stringsAsFactors = FALSE)
+    
+    # 4. Iterate and validate against Ligand
+    interactions <- list()
+    complex_map_list <- list()
+    
+    if(nrow(rec_combos) > 0) {
+      for (i in 1:nrow(rec_combos)) {
+        # Construct complex name
+        curr_rec_sub_isos <- as.character(rec_combos[i, ])
+        complex_name <- paste(curr_rec_sub_isos, collapse = "_")
+        
+        # Does this specific complex combination interact with ANY ligand isoform?
+        # We pass the vector of subunits. If ANY subunit binds the ligand, it counts.
+        if (validate_interaction(l_isoforms, curr_rec_sub_isos)) {
+          
+          # Now find WHICH ligand isoform specifically binds (could be multiple)
+          for (l_iso in l_isoforms) {
+            if (validate_interaction(l_iso, curr_rec_sub_isos)) {
+              new_row <- cellchat_row
+              new_row$ligand <- l_iso
+              new_row$receptor <- complex_name
+              new_row$interaction_name <- paste(ligand_symbol, receptor_symbol, sep = "_")
+              new_row$interaction_name_2 <- paste(l_iso, complex_name, sep = " - ")
+              interactions[[length(interactions) + 1]] <- new_row
+            }
+          }
+          
+          # Save Mapping
+          map_row <- data.frame(complex_name = complex_name, stringsAsFactors = FALSE)
+          for (k in seq_along(curr_rec_sub_isos)) {
+            map_row[[paste0("subunit_", k)]] <- curr_rec_sub_isos[k]
+          }
+          complex_map_list[[length(complex_map_list) + 1]] <- map_row
+        }
+      }
     }
     
-    isoform_combinations <- expand.grid(subunit_interacting_isoforms, stringsAsFactors = FALSE)
-    
-    interactions <- do.call(rbind, lapply(1:nrow(isoform_combinations), function(i) {
-      complex_isoforms <- as.character(isoform_combinations[i, ])
-      complex_receptor_name <- paste(complex_isoforms, collapse = "_")
-      do.call(rbind, lapply(1:nrow(ligand_mapping), function(j) {
-        new_row <- cellchat_row
-        new_row$ligand <- ligand_mapping$ENST[j]
-        new_row$receptor <- complex_receptor_name
-        new_row$interaction_name <- paste(ligand_symbol, receptor_symbol, sep = "_")
-        new_row$interaction_name_2 <- paste(ligand_mapping$ENST[j], "-", complex_receptor_name)
-        new_row$ligand_gene_symbol <- ligand_symbol
-        new_row$receptor_gene_symbol <- receptor_symbol
-        new_row$ligand_ensp <- ligand_mapping$ENSP[j]
-        new_row$receptor_ensp <- NA
-        new_row
-      }))
-    }))
-    
-    complex_mapping <- do.call(rbind, lapply(1:nrow(isoform_combinations), function(i) {
-      complex_isoforms <- as.character(isoform_combinations[i, ])
-      row <- data.frame(complex_name = paste(complex_isoforms, collapse = "_"), stringsAsFactors = FALSE)
-      for (k in 1:5) row[[paste0("subunit_", k)]] <- complex_isoforms[k]
-      row
-    }))
-    return(list(interactions = interactions, complex_mapping = complex_mapping))
+    return(list(
+      interactions = do.call(rbind, interactions), 
+      complex_mapping = do.call(rbind, complex_map_list)
+    ))
   }
-  
-  # --- CASE 3: Complex Ligand -> Simple Receptor ---
+
+  # =========================================================================
+  # CASE 3: Complex -> Simple
+  # =========================================================================
   if (ligand_is_complex && !receptor_is_complex) {
-    receptor_mapping <- get_isoforms_from_symbol(receptor_symbol)
-    receptor_ensts <- receptor_mapping$ENST
-    subunit_symbols <- parse_complex(ligand_symbol)
+    r_isoforms <- get_isoforms_from_symbol(receptor_symbol)
     
-    subunit_interacting_isoforms <- list()
-    for (subunit_symbol in subunit_symbols) {
-      interacting_isoforms <- find_interacting_subunit_isoforms(subunit_symbol, receptor_ensts)
-      if (length(interacting_isoforms) == 0) return(list(interactions = data.frame(), complex_mapping = data.frame()))
-      subunit_interacting_isoforms[[subunit_symbol]] <- interacting_isoforms
+    lig_subunits <- parse_complex(ligand_symbol)
+    lig_subunit_isoforms <- lapply(lig_subunits, get_isoforms_from_symbol)
+    lig_combos <- expand.grid(lig_subunit_isoforms, stringsAsFactors = FALSE)
+    
+    interactions <- list()
+    complex_map_list <- list()
+    
+    if(nrow(lig_combos) > 0) {
+      for (i in 1:nrow(lig_combos)) {
+        curr_lig_sub_isos <- as.character(lig_combos[i, ])
+        complex_name <- paste(curr_lig_sub_isos, collapse = "_")
+        
+        if (validate_interaction(curr_lig_sub_isos, r_isoforms)) {
+          
+          for (r_iso in r_isoforms) {
+            if (validate_interaction(curr_lig_sub_isos, r_iso)) {
+              new_row <- cellchat_row
+              new_row$ligand <- complex_name
+              new_row$receptor <- r_iso
+              new_row$interaction_name <- paste(ligand_symbol, receptor_symbol, sep = "_")
+              new_row$interaction_name_2 <- paste(complex_name, r_iso, sep = " - ")
+              interactions[[length(interactions) + 1]] <- new_row
+            }
+          }
+          
+          map_row <- data.frame(complex_name = complex_name, stringsAsFactors = FALSE)
+          for (k in seq_along(curr_lig_sub_isos)) {
+            map_row[[paste0("subunit_", k)]] <- curr_lig_sub_isos[k]
+          }
+          complex_map_list[[length(complex_map_list) + 1]] <- map_row
+        }
+      }
     }
     
-    isoform_combinations <- expand.grid(subunit_interacting_isoforms, stringsAsFactors = FALSE)
-    
-    interactions <- do.call(rbind, lapply(1:nrow(isoform_combinations), function(i) {
-      complex_isoforms <- as.character(isoform_combinations[i, ])
-      complex_ligand_name <- paste(complex_isoforms, collapse = "_")
-      do.call(rbind, lapply(1:nrow(receptor_mapping), function(j) {
-        new_row <- cellchat_row
-        new_row$ligand <- complex_ligand_name
-        new_row$receptor <- receptor_mapping$ENST[j]
-        new_row$interaction_name <- paste(ligand_symbol, receptor_symbol, sep = "_")
-        new_row$interaction_name_2 <- paste(complex_ligand_name, "-", receptor_mapping$ENST[j])
-        new_row$ligand_gene_symbol <- ligand_symbol
-        new_row$receptor_gene_symbol <- receptor_symbol
-        new_row$ligand_ensp <- NA
-        new_row$receptor_ensp <- receptor_mapping$ENSP[j]
-        new_row
-      }))
-    }))
-    
-    complex_mapping <- do.call(rbind, lapply(1:nrow(isoform_combinations), function(i) {
-      complex_isoforms <- as.character(isoform_combinations[i, ])
-      row <- data.frame(complex_name = paste(complex_isoforms, collapse = "_"), stringsAsFactors = FALSE)
-      for (k in 1:5) row[[paste0("subunit_", k)]] <- complex_isoforms[k]
-      row
-    }))
-    return(list(interactions = interactions, complex_mapping = complex_mapping))
+    return(list(
+      interactions = do.call(rbind, interactions), 
+      complex_mapping = do.call(rbind, complex_map_list)
+    ))
   }
-  
-  # --- CASE 4: Complex Ligand -> Complex Receptor ---
+
+  # =========================================================================
+  # CASE 4: Complex -> Complex
+  # =========================================================================
   if (ligand_is_complex && receptor_is_complex) {
-    ligand_subunit_symbols <- parse_complex(ligand_symbol)
-    receptor_subunit_symbols <- parse_complex(receptor_symbol)
+    # 1. Expand Ligand
+    lig_subunits <- parse_complex(ligand_symbol)
+    lig_subunit_isoforms <- lapply(lig_subunits, get_isoforms_from_symbol)
+    lig_combos <- expand.grid(lig_subunit_isoforms, stringsAsFactors = FALSE)
     
-    all_ligand_subunit_ensts <- unlist(lapply(ligand_subunit_symbols, function(s) get_isoforms_from_symbol(s)$ENST))
-    all_receptor_subunit_ensts <- unlist(lapply(receptor_subunit_symbols, function(s) get_isoforms_from_symbol(s)$ENST))
+    # 2. Expand Receptor
+    rec_subunits <- parse_complex(receptor_symbol)
+    rec_subunit_isoforms <- lapply(rec_subunits, get_isoforms_from_symbol)
+    rec_combos <- expand.grid(rec_subunit_isoforms, stringsAsFactors = FALSE)
     
-    ligand_subunit_interacting_isoforms <- list()
-    for (subunit_symbol in ligand_subunit_symbols) {
-      interacting_isoforms <- find_interacting_subunit_isoforms(subunit_symbol, all_receptor_subunit_ensts)
-      if (length(interacting_isoforms) == 0) return(list(interactions = data.frame(), complex_mapping = data.frame()))
-      ligand_subunit_interacting_isoforms[[subunit_symbol]] <- interacting_isoforms
+    interactions <- list()
+    complex_map_list <- list()
+    
+    # Loop over Ligand Combos
+    if(nrow(lig_combos) > 0 && nrow(rec_combos) > 0) {
+      for (i in 1:nrow(lig_combos)) {
+        curr_lig_sub_isos <- as.character(lig_combos[i, ])
+        l_complex_name <- paste(curr_lig_sub_isos, collapse = "_")
+        
+        # Loop over Receptor Combos
+        for (j in 1:nrow(rec_combos)) {
+          curr_rec_sub_isos <- as.character(rec_combos[j, ])
+          r_complex_name <- paste(curr_rec_sub_isos, collapse = "_")
+          
+          # Check if ANY piece of Ligand Complex binds ANY piece of Receptor Complex
+          if (validate_interaction(curr_lig_sub_isos, curr_rec_sub_isos)) {
+            new_row <- cellchat_row
+            new_row$ligand <- l_complex_name
+            new_row$receptor <- r_complex_name
+            new_row$interaction_name <- paste(ligand_symbol, receptor_symbol, sep = "_")
+            new_row$interaction_name_2 <- paste(l_complex_name, r_complex_name, sep = " - ")
+            interactions[[length(interactions) + 1]] <- new_row
+            
+            # Save Mapping (Ligand)
+            l_map <- data.frame(complex_name = l_complex_name, stringsAsFactors = FALSE)
+            for (k in seq_along(curr_lig_sub_isos)) l_map[[paste0("subunit_", k)]] <- curr_lig_sub_isos[k]
+            complex_map_list[[length(complex_map_list) + 1]] <- l_map
+            
+            # Save Mapping (Receptor)
+            r_map <- data.frame(complex_name = r_complex_name, stringsAsFactors = FALSE)
+            for (k in seq_along(curr_rec_sub_isos)) r_map[[paste0("subunit_", k)]] <- curr_rec_sub_isos[k]
+            complex_map_list[[length(complex_map_list) + 1]] <- r_map
+          }
+        }
+      }
     }
     
-    receptor_subunit_interacting_isoforms <- list()
-    for (subunit_symbol in receptor_subunit_symbols) {
-      interacting_isoforms <- find_interacting_subunit_isoforms(subunit_symbol, all_ligand_subunit_ensts)
-      if (length(interacting_isoforms) == 0) return(list(interactions = data.frame(), complex_mapping = data.frame()))
-      receptor_subunit_interacting_isoforms[[subunit_symbol]] <- interacting_isoforms
-    }
-    
-    ligand_isoform_combinations <- expand.grid(ligand_subunit_interacting_isoforms, stringsAsFactors = FALSE)
-    receptor_isoform_combinations <- expand.grid(receptor_subunit_interacting_isoforms, stringsAsFactors = FALSE)
-    
-    interactions <- do.call(rbind, lapply(1:nrow(ligand_isoform_combinations), function(i) {
-      complex_ligand_name <- paste(as.character(ligand_isoform_combinations[i, ]), collapse = "_")
-      do.call(rbind, lapply(1:nrow(receptor_isoform_combinations), function(j) {
-        complex_receptor_name <- paste(as.character(receptor_isoform_combinations[j, ]), collapse = "_")
-        new_row <- cellchat_row
-        new_row$ligand <- complex_ligand_name
-        new_row$receptor <- complex_receptor_name
-        new_row$interaction_name_2 <- paste(complex_ligand_name, "-", complex_receptor_name)
-        new_row
-      }))
-    }))
-    
-    # Combined mapping logic...
-    return(list(interactions = interactions, complex_mapping = data.frame())) # Simplified for brevity
+    return(list(
+      interactions = do.call(rbind, interactions), 
+      complex_mapping = unique(do.call(rbind, complex_map_list))
+    ))
   }
 }
 
